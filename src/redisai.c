@@ -178,17 +178,19 @@ int RAI_getTensorFromKeyspace(RedisModuleCtx *ctx, RedisModuleString *keyName,
 /* Return REDISMODULE_ERR if there was an error getting the Tensor.
  * Return REDISMODULE_OK if the tensor value is present at the localContextDict. */
 int RAI_getTensorFromLocalContext(RedisModuleCtx *ctx,
-                                  AI_dict *localContextDict,
+                                  RedisModuleDict *localContextDict,
                                   const char *localContextKey,
                                   RAI_Tensor **tensor) {
   int result = REDISMODULE_ERR;
-  AI_dictEntry *tensor_entry = AI_dictFind(localContextDict, localContextKey);
-  if (tensor_entry) {
-    *tensor = AI_dictGetVal(tensor_entry);
-    result = REDISMODULE_OK;
-  } else{
+  int doesNotExist = 0;
+  *tensor = RedisModule_DictGetC(localContextDict, (void*)localContextKey,
+                                 sizeof(localContextKey), &doesNotExist);
+  if (doesNotExist == 1) {
     RedisModule_ReplyWithError(ctx, "ERR tensor key is empty");
+  } else {
+    result = REDISMODULE_OK;
   }
+
   return result;
 }
 
@@ -1757,8 +1759,12 @@ int RedisAI_Config_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, i
 }
 
 
-int RAI_parseDAGLoadArgs(RedisModuleCtx *ctx, RedisModuleString **argv, int argc, AI_dict **localContextDict,
-                              const char* chaining_operator) {
+/** 
+* DAGRUN Building Block to parse  [LOAD <nkeys> key1 key2... ]
+*/
+int RAI_parseDAGLoadArgs(RedisModuleCtx *ctx, RedisModuleString **argv,
+                         int argc, RedisModuleDict **localContextDict,
+                         const char *chaining_operator) {
   if (argc < 3) {
     RedisModule_WrongArity(ctx);
     return -1;
@@ -1775,8 +1781,7 @@ int RAI_parseDAGLoadArgs(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
   int number_loaded_keys = 0;
   int separator_flag = 0;
   size_t argpos = 2;
-  for (; (argpos <= argc - 1) && (number_loaded_keys < n_keys);
-       argpos++) {
+  for (; (argpos <= argc - 1) && (number_loaded_keys < n_keys); argpos++) {
     const char *arg_string = RedisModule_StringPtrLen(argv[argpos], NULL);
     if (!strcasecmp(arg_string, chaining_operator)) {
       separator_flag = 1;
@@ -1784,16 +1789,57 @@ int RAI_parseDAGLoadArgs(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     } else {
       RAI_Tensor *t;
       RedisModuleKey *key;
-      const int status =
-          RAI_getTensorFromKeyspace(ctx, argv[argpos], &key, &t, REDISMODULE_READ);
+      const int status = RAI_getTensorFromKeyspace(ctx, argv[argpos], &key, &t,
+                                                   REDISMODULE_READ);
       if (status == REDISMODULE_ERR) {
         return -1;
       }
-      AI_dictAdd(*localContextDict, arg_string, t);
+      RedisModule_DictSetC(*localContextDict, (void*)arg_string, sizeof(arg_string),
+                           (void *)t);
       number_loaded_keys++;
     }
   }
-  if(number_loaded_keys != n_keys){
+  if (number_loaded_keys != n_keys) {
+    RedisModule_WrongArity(ctx);
+    return -1;
+  }
+  return argpos;
+}
+
+/** 
+* DAGRUN Building Block to parse  [PERSIST <nkeys> key1 key2... ]
+*/
+int RAI_parseDAGPersistArgs(RedisModuleCtx *ctx, RedisModuleString **argv,
+                         int argc, RedisModuleDict **localContextDict,
+                         const char *chaining_operator) {
+  if (argc < 3) {
+    RedisModule_WrongArity(ctx);
+    return -1;
+  }
+
+  long long n_keys;
+  const int retval = RedisModule_StringToLongLong(argv[1], &n_keys);
+  if (retval != REDISMODULE_OK || n_keys <= 0) {
+    RedisModule_ReplyWithError(
+        ctx, "ERR invalid or negative value found in number of keys to LOAD");
+    return -1;
+  }
+
+  int number_loaded_keys = 0;
+  int separator_flag = 0;
+  size_t argpos = 2;
+  for (; (argpos <= argc - 1) && (number_loaded_keys < n_keys); argpos++) {
+    const char *arg_string = RedisModule_StringPtrLen(argv[argpos], NULL);
+    if (!strcasecmp(arg_string, chaining_operator)) {
+      separator_flag = 1;
+      break;
+    } else {
+      RedisModule_DictSetC(*localContextDict, (void*)arg_string, sizeof(arg_string),
+                           (void *)1);
+      number_loaded_keys++;
+    }
+  }
+  if (number_loaded_keys != n_keys) {
     RedisModule_WrongArity(ctx);
     return -1;
   }
@@ -1801,16 +1847,17 @@ int RAI_parseDAGLoadArgs(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
 }
 
 /**
- * AI.DAGRUN [LOAD key1 key2... ] [PERSIST key1 key2... ] |> [COMMAND1] |> [COMMAND2] |> [COMMANDN]
+ * AI.DAGRUN [LOAD <nkeys> key1 key2... ] [PERSIST <nkeys> key1 key2... ] |> [COMMAND1] |> [COMMAND2] |> [COMMANDN]
  *
  * The request is queued and evaded asynchronously from a separate thread. The
  * client blocks until the computation finishes.
  */
 int RedisAI_DagRun_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
-                                  int argc) {
+                                int argc) {
   if (argc < 3) return RedisModule_WrongArity(ctx);
 
-  struct RedisAI_RunInfo *rinfo = RedisModule_Calloc(1, sizeof(struct RedisAI_RunInfo));
+  struct RedisAI_RunInfo *rinfo =
+      RedisModule_Calloc(1, sizeof(struct RedisAI_RunInfo));
   rinfo->runkey = NULL;
   rinfo->mctx = NULL;
   rinfo->sctx = NULL;
@@ -1821,42 +1868,60 @@ int RedisAI_DagRun_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
   int locals_flag = 0;
   int separator_flag = 0;
   long reply_length = 0;
-  AI_dict* dagTensorsContext = AI_dictCreate(&AI_dictTypeHeapStrings, NULL);
+
+  RedisModuleDict *dagTensorsContext = RedisModule_CreateDict(NULL);
+  RedisModuleDict *dagPersistTensorsContext = RedisModule_CreateDict(NULL);
 
   RedisModule_ReplyWithArray(ctx, REDISMODULE_POSTPONED_ARRAY_LEN);
   for (size_t argpos = 1; argpos <= argc - 1; argpos++) {
     const char *arg_string = RedisModule_StringPtrLen(argv[argpos], NULL);
     if (!strcasecmp(arg_string, "LOAD")) {
-      const int parse_result = RAI_parseDAGLoadArgs(ctx, &argv[argpos], argc - argpos, &dagTensorsContext, "|>");
+      const int parse_result = RAI_parseDAGLoadArgs(
+          ctx, &argv[argpos], argc - argpos, &dagTensorsContext, "|>");
       if (parse_result > 0) {
         argpos += parse_result - 1;
+      } else {
+        // accomodate for error on reply array
+        reply_length++;
       }
     }
     if (!strcasecmp(arg_string, "PERSIST")) {
-      // TODO: collect info about the tensors to persist
+      const int parse_result = RAI_parseDAGPersistArgs(
+          ctx, &argv[argpos], argc - argpos, &dagPersistTensorsContext, "|>");
+      if (parse_result > 0) {
+        argpos += parse_result - 1;
+      } else {
+        // accomodate for error on reply array
+        reply_length++;
+      }
     }
     if (!strcasecmp(arg_string, "AI.TENSORSET")) {
       reply_length++;
       RAI_Tensor *t = NULL;
-      const int parse_result = RAI_parseTensorSetArgs(ctx, &argv[argpos], argc - argpos, &t, 0);
+      const int parse_result =
+          RAI_parseTensorSetArgs(ctx, &argv[argpos], argc - argpos, &t, 0);
       if (parse_result > 0) {
-        const char *key_string = RedisModule_StringPtrLen(argv[argpos+1], NULL);
+        const char *key_string =
+            RedisModule_StringPtrLen(argv[argpos + 1], NULL);
         argpos += parse_result - 1;
-        AI_dictAdd(dagTensorsContext, key_string, t);
+        RedisModule_DictSetC(dagTensorsContext, (void*)key_string, sizeof(key_string),
+                             (void *)t);
         RedisModule_ReplyWithSimpleString(ctx, "OK");
       }
     }
     if (!strcasecmp(arg_string, "AI.TENSORGET")) {
       reply_length++;
-      if (argpos+1>=argc){
+      if (argpos + 1 >= argc) {
         RedisModule_WrongArity(ctx);
         break;
       }
-      const char *key_string = RedisModule_StringPtrLen(argv[argpos+1], NULL);
+      const char *key_string = RedisModule_StringPtrLen(argv[argpos + 1], NULL);
       RAI_Tensor *t = NULL;
-      const int get_result = RAI_getTensorFromLocalContext(ctx,dagTensorsContext,key_string,&t);
-      if (get_result==REDISMODULE_OK) {
-        const int parse_result = RAI_parseTensorGetArgs(ctx, &argv[argpos], argc - argpos, t);
+      const int get_result =
+          RAI_getTensorFromLocalContext(ctx, dagTensorsContext, key_string, &t);
+      if (get_result == REDISMODULE_OK) {
+        const int parse_result =
+            RAI_parseTensorGetArgs(ctx, &argv[argpos], argc - argpos, t);
         if (parse_result > 0) {
           argpos += parse_result - 1;
         }
@@ -1868,7 +1933,37 @@ int RedisAI_DagRun_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv,
     }
     // TODO: check we're enforcing chaining operators between commands
   }
-  // TODO: persist the tensors marked
+  // persist to keyspace tensors marked as persistent
+  RedisModuleDictIter *iter =
+      RedisModule_DictIteratorStartC(dagPersistTensorsContext, "^", NULL, 0);
+  char *currentKey;
+  size_t currentKeyLen;
+  while ((currentKey = RedisModule_DictNextC(iter, &currentKeyLen, NULL)) !=
+         NULL) {
+    int doesNotExist = 0;
+    RAI_Tensor *persistent_tensor = RedisModule_DictGetC(
+        dagTensorsContext, (void*)currentKey, currentKeyLen, &doesNotExist);
+    if (doesNotExist == 0) {
+        RedisModule_Log(ctx, "warning", "%s not preset in dagTensorsContext!", currentKey);
+      continue;
+    }
+    RedisModuleKey *key;
+    const int status = RAI_openKey_Tensor(
+        ctx, RedisModule_CreateString(ctx, currentKey, currentKeyLen), &key,
+        REDISMODULE_READ | REDISMODULE_WRITE);
+    if (status == REDISMODULE_ERR) {
+      continue;
+    }
+    if (RedisModule_ModuleTypeSetValue(key, RedisAI_TensorType,
+                                       persistent_tensor) != REDISMODULE_OK) {
+      reply_length++;
+      RedisModule_ReplyWithError(ctx, "ERR could not save tensor");
+    }
+    RedisModule_CloseKey(key);
+    RAI_TensorFree(persistent_tensor);
+  }
+  RedisModule_DictIteratorStop(iter);
+
   RedisModule_ReplySetArrayLength(ctx, reply_length);
 
   return REDISMODULE_OK;
